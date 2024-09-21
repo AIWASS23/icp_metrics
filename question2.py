@@ -1,96 +1,129 @@
-from google.colab import drive
-drive.mount('/content/drive')
-q1_dir = '/content/drive/My Drive/KITTI-Sequence'
-q2_dir = '/content/drive/My Drive/img_dtlabs'
-
-from sklearn.metrics import confusion_matrix, f1_score
-import tensorflow as tf
-import zipfile
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, Flatten, Dropout, Lambda, Input
-from tensorflow.keras import backend as K
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 import numpy as np
-import cv2
-import os
-import pandas as pd
+import pickle
+from PIL import Image
+from sklearn.metrics.pairwise import cosine_similarity
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-def load_images_from_directory(directory):
-    images = []
-    for root, dirs, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".jpg") or file.endswith(".png"):
-                img_path = os.path.join(root, file)
-                img = cv2.imread(img_path)
-                if img is not None:
-                    images.append((file, img))
-                else:
-                    print(f"Erro ao carregar a imagem: {img_path}")
-    return images
 
-images = load_images_from_directory(extract_dir)
 
-if len(images) > 0:
-    print(f"Total de imagens encontradas: {len(images)}")
-else:
-    print("Nenhuma imagem encontrada no diretório ou subdiretórios.")
+# Configurações
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+extract_dir = '/content/drive/My Drive/img_dtlabs'
 
-descriptor_size = 128
-shape = 50
-activation = 'relu6'
+# Transformações
+transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor(),
+])
 
-# Definindo o modelo
-model = Sequential()
-model.add(Input(shape=(shape, shape, 3)))
-model.add(Conv2D(16, kernel_size=(3, 3), activation=activation))
-model.add(Conv2D(32, (3, 3), activation=activation))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Conv2D(32, (3, 3), activation=activation))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Conv2D(32, (3, 3), activation=activation))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Conv2D(32, (3, 3), activation=activation))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
-model.add(Flatten())
+# Carregar dataset
+dataset = datasets.ImageFolder(extract_dir, transform=transform)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-model.add(Dense(descriptor_size))
-model.add(Lambda(lambda x: K.l2_normalize(x, axis=-1)))
-model.compile(optimizer='Adam', loss='mse')
+# Definição da CNN
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.fc1 = nn.Linear(32 * 16 * 16, 128)
+        self.fc2 = nn.Linear(128, len(dataset.classes))  # Número de classes
 
-def get_descriptor(image_path):
-    img = cv2.imread(image_path)
-    img = cv2.resize(img, (shape, shape))
-    img = np.expand_dims(img, axis=0) / 255.0
-    descriptor = model.predict(img)
-    return descriptor
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 32 * 16 * 16)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
-database = {}
+# Instanciar modelo
+model = SimpleCNN().to(device)
 
-def add_to_database(name, image_path):
-    descriptor = get_descriptor(image_path)
-    database[name] = descriptor
+# Função de perda e otimizador
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-def recognize_face(test_image_path):
-    test_descriptor = get_descriptor(test_image_path)
-    closest_name = None
-    closest_distance = float('inf')
 
-    for name, descriptor in database.items():
-        distance = np.linalg.norm(test_descriptor - descriptor)
-        if distance < closest_distance:
-            closest_distance = distance
-            closest_name = name
+num_epochs = 10
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for images, labels in dataloader:
+        images, labels = images.to(device), labels.to(device)
 
-    return closest_name, closest_distance
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
 
-add_to_database('celebrity_1', 'path/to/celebrity_1_image.jpg')
-add_to_database('celebrity_2', 'path/to/celebrity_2_image.jpg')
+        running_loss += loss.item()
 
-recognized_name, score = recognize_face('path/to/image_with_mask.jpg')
-print(f'Pessoa reconhecida: {recognized_name}, Score: {score}')
+    print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(dataloader):.4f}')
 
-infer_image = cv2.imread('path/to/image_with_mask.jpg')
-cv2.imshow('Imagem para Inferência', infer_image)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+"""
+## BD e VD
+"""
+
+def extract_descriptors(model, dataloader):
+    model.eval()
+    descriptors = []
+    labels_list = []
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            outputs = model(images)
+            descriptors.append(outputs.cpu().numpy())
+            labels_list.append(labels.cpu().numpy())
+    return np.concatenate(descriptors), np.concatenate(labels_list)
+
+# Extraindo descritores
+descriptors, labels = extract_descriptors(model, dataloader)
+
+# Salvando no banco de dados
+with open('descriptors.pkl', 'wb') as f:
+    pickle.dump((descriptors, labels), f)
+
+
+new_image = Image.open('caminho/para/nova/imagem.jpg')
+new_image = transform(new_image).unsqueeze(0).to(device)
+
+# Extrair descritor
+model.eval()
+with torch.no_grad():
+    new_descriptor = model(new_image).cpu().numpy()
+
+# Adicionar ao banco de dados
+descriptors = np.append(descriptors, new_descriptor, axis=0)
+
+# Atualizar banco de dados
+with open('descriptors.pkl', 'wb') as f:
+    pickle.dump((descriptors, labels), f)
+
+
+# Carregar descritores do banco de dados
+with open('descriptors.pkl', 'rb') as f:
+    descriptors, labels = pickle.load(f)
+
+# Calcular similaridade
+similarity_scores = cosine_similarity(new_descriptor, descriptors)
+best_match_index = np.argmax(similarity_scores)
+best_score = similarity_scores[0][best_match_index]
+
+# Exibir resultados
+print(f'Best match index: {best_match_index}, Score: {best_score}')
+print(f'Identified as: {labels[best_match_index]}')
+
+# Exibir a imagem
+plt.imshow(new_image.cpu().permute(1, 2, 0))
+plt.title(f'Match Score: {best_score:.2f}')
+plt.axis('off')
+plt.show()
